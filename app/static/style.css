@@ -56,7 +56,8 @@ body {
   grid-template-areas:
     "inputs diagram"
     "status status"
-    "results results";
+    "results results"
+    "shutdown shutdown";
   gap: 14px;
   padding: 14px 22px 28px;
   max-width: 1500px;
@@ -66,6 +67,7 @@ body {
 .panel-diagram { grid-area: diagram; }
 .panel-status { grid-area: status; }
 .panel-results { grid-area: results; }
+.panel-shutdown { grid-area: shutdown; }
 
 .panel {
   background: var(--panel);
@@ -232,6 +234,30 @@ tr.row-low td { background: var(--danger-bg); }
 @media (max-width: 980px) {
   .layout {
     grid-template-columns: 1fr;
-    grid-template-areas: "inputs" "diagram" "status" "results";
+    grid-template-areas: "inputs" "diagram" "status" "results" "shutdown";
   }
 }
+
+/* ---------- 停管分析 ---------- */
+.shutdown-summary {
+  display: flex; flex-wrap: wrap; gap: 10px;
+  margin: 4px 0 10px;
+}
+.shutdown-chip {
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  padding: 3px 12px;
+  font-size: 12.5px;
+  background: #fbfcfe;
+  color: var(--ink-soft);
+}
+.shutdown-chip b { font-family: var(--mono); color: var(--ink); }
+.shutdown-chip.summary-bad { border-color: #ecd9a8; background: var(--warn-bg); color: var(--warn); }
+.shutdown-chip.summary-bad b { color: var(--warn); }
+.shutdown-note { margin: 10px 2px 0; }
+tr.shutdown-disconnected td { background: var(--danger-bg); }
+tr.shutdown-newlow td { background: #f3effc; }
+tr.shutdown-notconv td { background: #f1f2f4; }
+.pill-disc { background: var(--danger-bg); color: var(--danger); }
+.pill-conn { background: #e4eefc; color: var(--primary-dark); }
+.pill-noconv { background: #e6e8ec; color: #4a545f; }

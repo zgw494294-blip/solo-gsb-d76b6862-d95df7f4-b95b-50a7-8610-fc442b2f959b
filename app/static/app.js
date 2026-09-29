@@ -10,6 +10,7 @@ const state = {
   pipes: [],
   minHead: "0",
   result: null,
+  shutdown: null,    // 逐根停管分析结果；编辑节点/管段/最低水头后清除
   pos: {},            // nodeId -> {x, y, pinned}
   temp: 0,            // 力导向布局“温度”，>0 时持续迭代
   rafId: null,
@@ -59,6 +60,7 @@ function loadSample() {
   ];
   state.minHead = "28";
   state.result = null;
+  state.shutdown = null;
   initPositions(true);
   renderAll();
   solve();
@@ -72,6 +74,7 @@ function resetAll() {
   state.pipes = [{ id: "P1", start: "S", end: "A", r: "1" }];
   state.minHead = "0";
   state.result = null;
+  state.shutdown = null;
   initPositions(true);
   renderAll();
   setBanner("idle", "填写数据后点击“求解”。所有数值必须为有限数，且管网为无向连通图。");
@@ -136,6 +139,7 @@ function renderNodeRows() {
               }
             });
           }
+          markDirty();
           renderNodeRows();
         } else {
           node[key] = el.value;
@@ -545,6 +549,7 @@ async function solve() {
   const { payload, errors } = buildPayload();
   if (errors.length) {
     state.result = null;
+    clearShutdown();
     $("#resultsPanel").hidden = true;
     draw();
     setBanner("err", "输入不合法：\n" + dedupe(errors).map((e) => `• ${e}`).join("\n"));
@@ -561,12 +566,14 @@ async function solve() {
     });
     data = await resp.json();
   } catch (err) {
+    clearShutdown();
     setBanner("err", `无法连接求解服务：${err.message}`);
     return;
   }
 
   if (!resp.ok || !data.ok) {
     state.result = null;
+    clearShutdown();
     $("#resultsPanel").hidden = true;
     draw();
     setBanner("err", data.error || `求解失败（HTTP ${resp.status}）。`);
@@ -574,6 +581,7 @@ async function solve() {
   }
 
   state.result = data.result;
+  clearShutdown();
   renderResults(state.result);
   draw();
   const r = state.result;
@@ -597,8 +605,10 @@ function setBanner(kind, text) {
   b.textContent = text;
 }
 
-/* 求解后任何编辑都会让旧结果失效，提示重新求解 */
+/* 求解后任何编辑都会让旧结果失效，提示重新求解；
+   节点、管段或最低水头的任何改动同样清除旧的停管分析。 */
 function markDirty() {
+  clearShutdown();
   if (!state.result) return;
   state.result = null;
   $("#resultsPanel").hidden = true;
@@ -661,17 +671,151 @@ function renderResults(r) {
   $("#resultsPanel").scrollIntoView({ behavior: "smooth", block: "nearest" });
 }
 
+/* ------------------------------ 逐根停管分析 ------------------------------ */
+function clearShutdown() {
+  if (!state.shutdown) return;
+  state.shutdown = null;
+  $("#shutdownPanel").hidden = true;
+}
+
+function nodeListHtml(ids) {
+  if (!ids || !ids.length) return '<span class="hint">无</span>';
+  return ids.map((id) => `<span class="cell-id">${escapeHtml(id)}</span>`).join("、");
+}
+
+function renderShutdown(analysis) {
+  $("#shutdownPanel").hidden = false;
+  $("#shutdownCount").textContent =
+    `共 ${analysis.scenarios.length} 个情景 · 限值 ${fmt(analysis.min_head)}`;
+
+  const chips = [
+    ["断联（失供）", analysis.disconnected_count, "disc"],
+    ["连通（重新求解）", analysis.connected_count, "conn"],
+    ["不收敛（单独标明）", analysis.not_converged_count,
+      analysis.not_converged_count ? "bad" : ""],
+  ];
+  $("#shutdownSummary").innerHTML = chips.map(([k, v, cls]) =>
+    `<span class="shutdown-chip ${cls === "bad" && v ? "summary-bad" : ""}">${k}：<b>${v}</b></span>`
+  ).join("");
+
+  $("#shutdownTbody").innerHTML = analysis.scenarios.map((s) => {
+    let trCls = "";
+    let status;
+    let unserved = "—";
+    let unservedD = "—";
+    let minHeadCell = "—";
+    let belowCell = "—";
+    let newBelowCell = "—";
+    let note = "";
+
+    if (s.status === "disconnected") {
+      trCls = "shutdown-disconnected";
+      status = `<span class="pill pill-disc">断联失供</span>`;
+      unserved = nodeListHtml(s.unserved_nodes);
+      unservedD = fmt(s.unserved_demand);
+      note = "与水源断开，不生成水头";
+    } else if (s.status === "connected") {
+      const isNewLow = s.new_below_nodes.length > 0;
+      trCls = isNewLow ? "shutdown-newlow" : "";
+      status = `<span class="pill pill-conn">连通</span>`;
+      minHeadCell = `${escapeHtml(s.min_demand_node)}：${fmt(s.min_demand_head)}`;
+      belowCell = nodeListHtml(s.below_limit_nodes);
+      newBelowCell = nodeListHtml(s.new_below_nodes);
+      note = `重新求解（${escapeHtml(s.solver_method || "")}）`;
+    } else {
+      trCls = "shutdown-notconv";
+      status = `<span class="pill pill-noconv">不收敛</span>`;
+      note = escapeHtml(s.error || "该情景单独求解不收敛，不影响其余情景。");
+    }
+
+    return `<tr class="${trCls}">
+      <td class="num-col">${s.rank}</td>
+      <td class="cell-id">${escapeHtml(s.pipe_id)}
+        <span class="hint">（${escapeHtml(s.pipe_start)} → ${escapeHtml(s.pipe_end)}）</span></td>
+      <td>${status}</td>
+      <td>${unserved}</td>
+      <td class="num-col">${unservedD}</td>
+      <td class="num-col">${minHeadCell}</td>
+      <td>${belowCell}</td>
+      <td>${newBelowCell}</td>
+      <td>${note}</td>
+    </tr>`;
+  }).join("");
+
+  $("#shutdownPanel").scrollIntoView({ behavior: "smooth", block: "nearest" });
+}
+
+async function runShutdownAnalysis() {
+  const { payload, errors } = buildPayload();
+  if (errors.length) {
+    clearShutdown();
+    setBanner("err", "输入不合法：\n" + dedupe(errors).map((e) => `• ${e}`).join("\n"));
+    return;
+  }
+
+  setBanner("idle", "逐根停管分析进行中……");
+  let resp, data;
+  try {
+    resp = await fetch("/api/shutdown-analysis", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+    });
+    data = await resp.json();
+  } catch (err) {
+    clearShutdown();
+    setBanner("err", `无法连接求解服务：${err.message}`);
+    return;
+  }
+
+  if (!resp.ok || !data.ok) {
+    clearShutdown();
+    setBanner("err", data.error || `停管分析失败（HTTP ${resp.status}）。`);
+    return;
+  }
+
+  const analysis = data.result;
+  state.shutdown = analysis;
+  // 基线结果与“求解”一致，一并展示
+  state.result = analysis.baseline;
+  renderResults(state.result);
+  renderShutdown(analysis);
+  draw();
+
+  const a = analysis;
+  const top = a.scenarios[0];
+  let head;
+  if (!top) {
+    head = "停管分析完成。";
+  } else if (top.status === "disconnected") {
+    head = `最高风险：停用 ${top.pipe_id} 将使 ${top.unserved_nodes.length} 个用水节点` +
+      `（${top.unserved_nodes.join("、")}）失供，失供需水量合计 ${fmt(top.unserved_demand)}。`;
+  } else if (top.status === "connected") {
+    head = `最高风险：停用 ${top.pipe_id} 后仍全部连通，最低用水节点水头为 ` +
+      `${top.min_demand_node}=${fmt(top.min_demand_head)}。`;
+  } else {
+    head = "停管分析完成（各情景均不收敛）。";
+  }
+  const tail = `断联 ${a.disconnected_count} 个、连通 ${a.connected_count} 个、` +
+    `不收敛 ${a.not_converged_count} 个情景。`;
+  const kind = a.disconnected_count || a.not_converged_count ? "warn" : "ok";
+  setBanner(kind, `${head}${tail}`);
+}
+
 /* ------------------------------ 事件绑定 ------------------------------ */
 $("#addNodeBtn").addEventListener("click", addNode);
 $("#addPipeBtn").addEventListener("click", addPipe);
 $("#sampleBtn").addEventListener("click", loadSample);
 $("#resetBtn").addEventListener("click", resetAll);
 $("#solveBtn").addEventListener("click", solve);
+$("#shutdownBtn").addEventListener("click", runShutdownAnalysis);
 $("#relayoutBtn").addEventListener("click", () => { initPositions(true); draw(); });
 $("#minHeadInput").addEventListener("input", (e) => {
   state.minHead = e.target.value;
+  // 限值变化会改变“低于限值/新增低水头”的判定，旧停管分析必须清除
+  clearShutdown();
   if (state.result) {
-    // 最低水头变化时本地重算标红，无需重新求解
+    // 最低水头变化时基线标红可本地重算，无需重新求解
     const mh = Number(state.minHead);
     if (Number.isFinite(mh)) {
       state.result.min_head = mh;

@@ -19,6 +19,7 @@
       </label>
       <button id="sampleBtn" class="btn" type="button">载入示例</button>
       <button id="resetBtn" class="btn btn-ghost" type="button">重置</button>
+      <button id="shutdownBtn" class="btn" type="button" title="逐根评估停管后果并按风险排序">停管分析</button>
       <button id="solveBtn" class="btn btn-primary" type="button">求解</button>
     </div>
   </header>
@@ -117,6 +118,37 @@
           <tbody id="pipeResultTbody"></tbody>
         </table>
       </div>
+    </section>
+
+    <!-- 下方：逐根停管分析 -->
+    <section class="panel panel-shutdown" id="shutdownPanel" hidden>
+      <div class="panel-head">
+        <h2>逐根停管分析 <span class="hint" id="shutdownCount"></span></h2>
+      </div>
+      <div id="shutdownSummary" class="shutdown-summary"></div>
+      <div class="table-wrap">
+        <table class="grid result-grid" id="shutdownTable">
+          <thead>
+            <tr>
+              <th class="num-col">风险序</th>
+              <th>停管管段</th>
+              <th>状态</th>
+              <th>失供用水节点</th>
+              <th class="num-col">失供需水量 Σd</th>
+              <th class="num-col">最低用水节点水头</th>
+              <th>低于限值节点</th>
+              <th>比基线新增低水头节点</th>
+              <th>备注</th>
+            </tr>
+          </thead>
+          <tbody id="shutdownTbody"></tbody>
+        </table>
+      </div>
+      <p class="hint shutdown-note">
+        排序规则：断联情景（有用水节点与水源断开，不生成水头）按失供需水量降序排在最前；
+        连通情景按最低用水节点水头升序；同分保持管段录入顺序；单个情景不收敛单独标明并排最后。
+        编辑节点、管段或最低水头限值后，本分析会被清除，需重新运行。
+      </p>
     </section>
   </main>
 

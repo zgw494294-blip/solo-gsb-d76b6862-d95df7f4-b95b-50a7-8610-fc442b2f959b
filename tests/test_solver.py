@@ -11,7 +11,12 @@ from fastapi.testclient import TestClient
 from app.main import app
 from app.solver import (
     CHECK_TOL,
+    STATUS_CONNECTED,
+    STATUS_DISCONNECTED,
+    STATUS_NOT_CONVERGED,
+    SolverNotConverged,
     ValidationError,
+    analyze_pipe_shutdowns,
     solve_network,
     validate_payload,
 )
@@ -249,6 +254,231 @@ def test_static_index_served():
     assert client.get("/app.js").status_code == 200
     assert client.get("/style.css").status_code == 200
     assert client.get("/api/health").json()["status"] == "ok"
+
+
+# ---------------------------- 逐根停管分析 ---------------------------- #
+def shutdown_tree():
+    """树状网：S-A-B 主干，B-C 支段，A-D 支段；每根都是桥。"""
+    return {
+        "nodes": [
+            {"id": "S", "type": "source", "head": 40.0},
+            {"id": "A", "type": "demand", "demand": 1.0},
+            {"id": "B", "type": "demand", "demand": 2.0},
+            {"id": "C", "type": "demand", "demand": 4.0},
+            {"id": "D", "type": "demand", "demand": 3.0},
+        ],
+        "pipes": [
+            {"id": "P1", "start": "S", "end": "A", "r": 0.1},
+            {"id": "P2", "start": "A", "end": "B", "r": 0.5},
+            {"id": "P3", "start": "B", "end": "C", "r": 0.5},
+            {"id": "P4", "start": "A", "end": "D", "r": 0.2},
+        ],
+        "min_head": 20.0,
+    }
+
+
+def shutdown_loop():
+    """环 S-A-B-C-S 加末端分支 A-D（P5 是唯一的桥）。"""
+    return {
+        "nodes": [
+            {"id": "S", "type": "source", "head": 30.0},
+            {"id": "A", "type": "demand", "demand": 1.0},
+            {"id": "B", "type": "demand", "demand": 2.0},
+            {"id": "C", "type": "demand", "demand": 1.0},
+            {"id": "D", "type": "demand", "demand": 2.0},
+        ],
+        "pipes": [
+            {"id": "P1", "start": "S", "end": "A", "r": 0.05},
+            {"id": "P2", "start": "A", "end": "B", "r": 0.5},
+            {"id": "P3", "start": "B", "end": "C", "r": 0.5},
+            {"id": "P4", "start": "C", "end": "S", "r": 0.05},
+            {"id": "P5", "start": "A", "end": "D", "r": 0.3},
+        ],
+        "min_head": 20.0,
+    }
+
+
+def test_shutdown_tree_all_disconnected_sorted_by_demand():
+    res = analyze_pipe_shutdowns(validate_payload(shutdown_tree()))
+    scenarios = res["scenarios"]
+
+    assert res["disconnected_count"] == 4
+    assert res["connected_count"] == 0
+    assert res["not_converged_count"] == 0
+    assert [s["pipe_id"] for s in scenarios] == ["P1", "P2", "P3", "P4"]
+    # 复核失供需水量严格降序（P1: 1+2+4+3=10，P2: B+C=6，P3: C=4，P4: D=3）
+    demands = [s["unserved_demand"] for s in scenarios]
+    assert demands == [10.0, 6.0, 4.0, 3.0]
+    assert demands == sorted(demands, reverse=True)
+
+    # 断联情景不给水头
+    p1 = scenarios[0]
+    assert p1["status"] == STATUS_DISCONNECTED
+    assert p1["unserved_nodes"] == ["A", "B", "C", "D"]
+    assert "min_demand_head" not in p1
+    assert "heads" not in p1
+
+    # 各情景风险序连续
+    assert [s["rank"] for s in scenarios] == [1, 2, 3, 4]
+
+
+def test_shutdown_loop_mixed_statuses_and_new_below():
+    res = analyze_pipe_shutdowns(validate_payload(shutdown_loop()))
+    scenarios = res["scenarios"]
+
+    assert res["disconnected_count"] == 1
+    assert res["connected_count"] == 4
+    assert res["not_converged_count"] == 0
+
+    # 唯一断联情景（P5，失供 D=2.0）排最前
+    first = scenarios[0]
+    assert first["status"] == STATUS_DISCONNECTED
+    assert first["pipe_id"] == "P5"
+    assert first["unserved_nodes"] == ["D"]
+    assert first["unserved_demand"] == 2.0
+
+    # 其余连通情景按最低用水节点水头升序
+    connected = [s for s in scenarios if s["status"] == STATUS_CONNECTED]
+    heads = [s["min_demand_head"] for s in connected]
+    assert heads == sorted(heads)
+    for s in connected:
+        assert s["min_demand_head"] == s["heads"][s["min_demand_node"]]
+
+    # 基线全部合格；停 P1 后 A/B/D 低于限值且全部为“新增”
+    assert res["baseline"]["below_min_head"] == []
+    p1 = next(s for s in scenarios if s["pipe_id"] == "P1")
+    assert set(p1["below_limit_nodes"]) == {"A", "B", "D"}
+    assert set(p1["new_below_nodes"]) == {"A", "B", "D"}
+
+
+def test_shutdown_new_below_relative_to_baseline():
+    """基线已有的低水头节点不计入“新增”。"""
+    payload = shutdown_loop()
+    payload["min_head"] = 29.0  # 基线下 A、D 等已低于限值
+    res = analyze_pipe_shutdowns(validate_payload(payload))
+    baseline_below = set(res["baseline"]["below_min_head"])
+    for s in res["scenarios"]:
+        if s["status"] != STATUS_CONNECTED:
+            continue
+        assert not (set(s["new_below_nodes"]) & baseline_below)
+        assert set(s["new_below_nodes"]).issubset(set(s["below_limit_nodes"]))
+
+
+def test_shutdown_ties_keep_pipe_entry_order():
+    """失供量相同的断联情景同分，保持管段录入顺序。"""
+    payload = {
+        "nodes": [
+            {"id": "S", "type": "source", "head": 30.0},
+            {"id": "J", "type": "demand", "demand": 0.0},
+            {"id": "A", "type": "demand", "demand": 1.0},
+            {"id": "B", "type": "demand", "demand": 1.0},
+        ],
+        # 树：S-J 主干（失供 2.0），J-A、J-B 两个分支桥失供量同为 1.0
+        "pipes": [
+            {"id": "P1", "start": "S", "end": "J", "r": 1.0},
+            {"id": "P2", "start": "J", "end": "A", "r": 1.0},
+            {"id": "P3", "start": "J", "end": "B", "r": 1.0},
+        ],
+        "min_head": 0.0,
+    }
+    res = analyze_pipe_shutdowns(validate_payload(payload))
+    scenarios = res["scenarios"]
+    assert [s["pipe_id"] for s in scenarios] == ["P1", "P2", "P3"]
+    assert all(s["status"] == STATUS_DISCONNECTED for s in scenarios)
+    assert scenarios[1]["unserved_nodes"] == ["A"]
+    assert scenarios[2]["unserved_nodes"] == ["B"]
+    assert scenarios[1]["unserved_demand"] == scenarios[2]["unserved_demand"] == 1.0
+
+
+def test_shutdown_single_not_converged_isolated_and_last(monkeypatch):
+    """某个连通情景不收敛：单独标明、排最后，其余情景照常。"""
+    from app import solver as solver_mod
+
+    payload = shutdown_loop()
+    net = validate_payload(payload)
+    original = solver_mod.solve_network
+    state = {"calls": 0}
+
+    def patched(network):
+        state["calls"] += 1
+        # 第 1 次是基线；P5 在最前断联不触发求解；
+        # 随后依次是 P1、P2、P3、P4 的连通求解，让 P3（第 4 次）不收敛
+        if state["calls"] == 4:
+            raise SolverNotConverged("模拟 P3 情景不收敛")
+        return original(network)
+
+    monkeypatch.setattr(solver_mod, "solve_network", patched)
+    res = solver_mod.analyze_pipe_shutdowns(net)
+
+    assert res["connected_count"] == 3
+    assert res["not_converged_count"] == 1
+    last = res["scenarios"][-1]
+    assert last["pipe_id"] == "P3"
+    assert last["status"] == STATUS_NOT_CONVERGED
+    assert "不收敛" in last["error"]
+    assert "heads" not in last
+    # 其余情景不受影响
+    assert all(s["status"] != STATUS_NOT_CONVERGED for s in res["scenarios"][:-1])
+    # 断联仍排在最前
+    assert res["scenarios"][0]["status"] == STATUS_DISCONNECTED
+
+
+def test_shutdown_zero_demand_unserved_listed():
+    """零需水量的失供节点仍须列出，只是失供需水量合计为 0。"""
+    payload = {
+        "nodes": [
+            {"id": "S", "type": "source", "head": 30.0},
+            {"id": "A", "type": "demand", "demand": 0.0},
+            {"id": "B", "type": "demand", "demand": 0.0},
+        ],
+        "pipes": [
+            {"id": "P1", "start": "S", "end": "A", "r": 1.0},
+            {"id": "P2", "start": "A", "end": "B", "r": 1.0},
+        ],
+        "min_head": 0.0,
+    }
+    res = analyze_pipe_shutdowns(validate_payload(payload))
+    p1 = res["scenarios"][0]
+    assert p1["status"] == STATUS_DISCONNECTED
+    assert set(p1["unserved_nodes"]) == {"A", "B"}
+    assert p1["unserved_demand"] == 0.0
+
+
+def test_api_shutdown_analysis_ok():
+    resp = client.post("/api/shutdown-analysis", json=shutdown_loop())
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["ok"] is True
+    r = data["result"]
+    assert len(r["scenarios"]) == 5
+    assert r["baseline"]["converged"] is True
+    assert {s["pipe_id"] for s in r["scenarios"]} == {"P1", "P2", "P3", "P4", "P5"}
+    # 基线字段与 /api/solve 一致
+    assert "heads" in r["baseline"] and "flows" in r["baseline"]
+
+
+def test_api_shutdown_analysis_validation_error():
+    payload = shutdown_tree()
+    payload["pipes"][0]["r"] = -1
+    resp = client.post("/api/shutdown-analysis", json=payload)
+    assert resp.status_code == 422
+    assert "阻力" in resp.json()["error"]
+
+
+def test_api_shutdown_analysis_empty_body():
+    resp = client.post("/api/shutdown-analysis", content=b"",
+                       headers={"Content-Type": "application/json"})
+    assert resp.status_code == 400
+
+
+def test_api_shutdown_analysis_rejects_nan_token():
+    body = '{"nodes":[{"id":"S","type":"source","head":NaN},' \
+           '{"id":"A","type":"demand","demand":1}],' \
+           '"pipes":[{"id":"P1","start":"S","end":"A","r":1}],"min_head":0}'
+    resp = client.post("/api/shutdown-analysis", content=body,
+                       headers={"Content-Type": "application/json"})
+    assert resp.status_code == 400
+    assert "JSON" in resp.json()["error"]
 
 
 # ---------------------------- 随机网络数值稳健性 ---------------------------- #

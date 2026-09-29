@@ -459,3 +459,116 @@ def solve_network(net: Network) -> dict[str, Any]:
         "min_head": net.min_head,
         "below_min_head": below,
     }
+
+
+# --------------------------------------------------------------------------- #
+# 逐根停管情景分析
+# --------------------------------------------------------------------------- #
+STATUS_DISCONNECTED = "disconnected"     # 有用水节点与水源断开：失供，不生成水头
+STATUS_CONNECTED = "connected"           # 仍全部连通：重新求解成功
+STATUS_NOT_CONVERGED = "not_converged"   # 仍连通但该情景单独求解不收敛
+
+
+def _reachable_from_source(net: Network,
+                           pipes: list[dict[str, Any]]) -> set[str]:
+    """在给定管段构成的无向图上，返回从水源可达的全部节点编号。"""
+    adj: dict[str, list[str]] = {n["id"]: [] for n in net.nodes}
+    for pipe in pipes:
+        adj[pipe["start"]].append(pipe["end"])
+        adj[pipe["end"]].append(pipe["start"])
+    source_id = next(n["id"] for n in net.nodes if n["type"] == "source")
+    seen = {source_id}
+    stack = [source_id]
+    while stack:
+        u = stack.pop()
+        for v in adj[u]:
+            if v not in seen:
+                seen.add(v)
+                stack.append(v)
+    return seen
+
+
+def analyze_pipe_shutdowns(net: Network) -> dict[str, Any]:
+    """逐根停管后果评估：每根管段一个独立情景。
+
+    先用现有校验后的 Network 求基线；随后对每根管段：
+      * 移除后若存在与水源断开的用水节点 → 断联情景，列失供节点与需水量之和，
+        不生成水头；
+      * 仍全部连通 → 在删减后的管网上重新稳态求解，给出最低用水节点水头、
+        低于限值的节点与比基线新增的低水头节点；
+      * 单个情景不收敛 → 单独标明，不影响其余情景。
+    排序：断联情景按失供需水量降序在前，连通情景按最低用水节点水头升序居中，
+    不收敛情景排最后；同分（稳定排序）保持管段录入顺序。
+    """
+    baseline = solve_network(net)
+    baseline_below = set(baseline["below_min_head"])
+    demand_ids = [n["id"] for n in net.nodes if n["type"] == "demand"]
+    demand_value = {
+        n["id"]: n["demand"] for n in net.nodes if n["type"] == "demand"
+    }
+
+    scenarios: list[dict[str, Any]] = []
+    for k, removed in enumerate(net.pipes):
+        remaining = [p for j, p in enumerate(net.pipes) if j != k]
+        scenario: dict[str, Any] = {
+            "pipe_index": k,
+            "pipe_id": removed["id"],
+            "pipe_start": removed["start"],
+            "pipe_end": removed["end"],
+        }
+
+        reachable = _reachable_from_source(net, remaining)
+        unserved = [nid for nid in demand_ids if nid not in reachable]
+        if unserved:
+            scenario.update({
+                "status": STATUS_DISCONNECTED,
+                "unserved_nodes": unserved,
+                "unserved_demand": float(sum(demand_value[nid] for nid in unserved)),
+            })
+            scenarios.append(scenario)
+            continue
+
+        reduced = Network(nodes=net.nodes, pipes=remaining, min_head=net.min_head)
+        try:
+            solution = solve_network(reduced)
+        except SolverNotConverged as exc:
+            scenario.update({"status": STATUS_NOT_CONVERGED, "error": str(exc)})
+        else:
+            heads = solution["heads"]
+            min_node = min(demand_ids, key=lambda nid: heads[nid])
+            below = list(solution["below_min_head"])
+            new_below = [nid for nid in below if nid not in baseline_below]
+            scenario.update({
+                "status": STATUS_CONNECTED,
+                "heads": heads,
+                "min_demand_node": min_node,
+                "min_demand_head": float(heads[min_node]),
+                "below_limit_nodes": below,
+                "new_below_nodes": new_below,
+                "solver_method": solution["method"],
+            })
+        scenarios.append(scenario)
+
+    def sort_key(s: dict[str, Any]) -> tuple[int, float, float]:
+        if s["status"] == STATUS_DISCONNECTED:
+            return (0, -float(s["unserved_demand"]), 0.0)
+        if s["status"] == STATUS_CONNECTED:
+            return (1, 0.0, float(s["min_demand_head"]))
+        return (2, 0.0, 0.0)
+
+    # Python 的排序稳定：失供量或最低水头相同时保持管段录入顺序
+    scenarios.sort(key=sort_key)
+    for rank, scenario in enumerate(scenarios, start=1):
+        scenario["rank"] = rank
+
+    return {
+        "min_head": net.min_head,
+        "baseline": baseline,
+        "scenarios": scenarios,
+        "disconnected_count": sum(
+            s["status"] == STATUS_DISCONNECTED for s in scenarios),
+        "connected_count": sum(
+            s["status"] == STATUS_CONNECTED for s in scenarios),
+        "not_converged_count": sum(
+            s["status"] == STATUS_NOT_CONVERGED for s in scenarios),
+    }
