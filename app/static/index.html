@@ -20,6 +20,7 @@
       <button id="sampleBtn" class="btn" type="button">载入示例</button>
       <button id="resetBtn" class="btn btn-ghost" type="button">重置</button>
       <button id="solveBtn" class="btn btn-primary" type="button">求解</button>
+      <button id="outageBtn" class="btn" type="button" title="逐根评估每根管段被单独停用的后果">停管分析</button>
     </div>
   </header>
 
@@ -117,6 +118,33 @@
           <tbody id="pipeResultTbody"></tbody>
         </table>
       </div>
+    </section>
+
+    <!-- 逐根停管情景分析 -->
+    <section class="panel panel-outage" id="outagePanel" hidden>
+      <div class="panel-head">
+        <h2>逐根停管分析 <span class="hint">每根管段单独停用的独立情景，按风险排序</span></h2>
+      </div>
+      <div class="summary-grid" id="outageSummary"></div>
+      <div class="table-wrap">
+        <table class="grid result-grid" id="outageTable">
+          <thead>
+            <tr>
+              <th class="num-col">风险序</th>
+              <th>停用管段</th>
+              <th>情景状态</th>
+              <th>失供节点 / 失供需水量</th>
+              <th class="num-col">最低用水节点水头</th>
+              <th>低于限值节点</th>
+              <th>比基线新增低水头节点</th>
+            </tr>
+          </thead>
+          <tbody id="outageTbody"></tbody>
+        </table>
+      </div>
+      <p class="hint" id="outageNote">
+        排序规则：断联情景按失供需水量降序在前；连通情景按最低用水节点水头升序随后；同分保持管段录入顺序；不收敛情景单独标明并排最后。
+      </p>
     </section>
   </main>
 

@@ -10,6 +10,7 @@ const state = {
   pipes: [],
   minHead: "0",
   result: null,
+  outage: null,       // 最近一次逐根停管分析结果
   pos: {},            // nodeId -> {x, y, pinned}
   temp: 0,            // 力导向布局“温度”，>0 时持续迭代
   rafId: null,
@@ -545,12 +546,15 @@ async function solve() {
   const { payload, errors } = buildPayload();
   if (errors.length) {
     state.result = null;
+    clearOutage();
     $("#resultsPanel").hidden = true;
     draw();
     setBanner("err", "输入不合法：\n" + dedupe(errors).map((e) => `• ${e}`).join("\n"));
     return;
   }
 
+  // 重新求解即令旧的停管分析失效（成功后可再点“停管分析”）
+  clearOutage();
   setBanner("idle", "求解中……");
   let resp, data;
   try {
@@ -591,6 +595,113 @@ async function solve() {
 
 function dedupe(arr) { return [...new Set(arr)]; }
 
+/* ------------------------------ 逐根停管分析 ------------------------------ */
+async function analyzeOutages() {
+  const { payload, errors } = buildPayload();
+  if (errors.length) {
+    clearOutage();
+    draw();
+    setBanner("err", "输入不合法：\n" + dedupe(errors).map((e) => `• ${e}`).join("\n"));
+    return;
+  }
+
+  setBanner("idle", "停管分析中……（逐根移除并重新求解）");
+  let resp, data;
+  try {
+    resp = await fetch("/api/analyze-outages", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+    });
+    data = await resp.json();
+  } catch (err) {
+    setBanner("err", `无法连接求解服务：${err.message}`);
+    return;
+  }
+
+  if (!resp.ok || !data.ok) {
+    clearOutage();
+    setBanner("err", data.error || `停管分析失败（HTTP ${resp.status}）。`);
+    return;
+  }
+
+  // 分析内含基线求解，直接作为当前稳态结果展示
+  state.result = data.analysis.baseline;
+  state.outage = data.analysis;
+  renderResults(state.result);
+  renderOutage(state.outage);
+  draw();
+  const c = state.outage.counts;
+  setBanner(c.disconnected || c.not_converged ? "warn" : "ok",
+    `停管分析完成：共 ${state.outage.scenarios.length} 个情景（每根管段一个）——` +
+    `断联失供 ${c.disconnected} 个、连通可解 ${c.connected} 个、不收敛 ${c.not_converged} 个；` +
+    `已按风险排序（断联按失供量降序 → 连通按最低水头升序 → 不收敛排最后）。`);
+}
+
+function outageStatusCell(s) {
+  if (s.status === "disconnected") {
+    return `<span class="pill pill-low">断联失供</span>`;
+  }
+  if (s.status === "not_converged") {
+    return `<span class="pill pill-nc" title="${escapeAttr(s.error)}">不收敛</span>`;
+  }
+  return `<span class="pill pill-ok">连通可解</span>`;
+}
+
+function renderOutage(a) {
+  $("#outagePanel").hidden = false;
+  const c = a.counts;
+  const cards = [
+    { k: "情景总数（= 管段数）", v: String(a.scenarios.length) },
+    { k: "断联失供情景", v: String(c.disconnected), cls: c.disconnected ? "bad" : "good" },
+    { k: "连通可解情景", v: String(c.connected) },
+    { k: "不收敛情景", v: String(c.not_converged), cls: c.not_converged ? "bad" : "good" },
+    { k: "当前最低水头限值", v: fmt(a.min_head) },
+  ];
+  $("#outageSummary").innerHTML = cards.map((cc) =>
+    `<div class="summary-card ${cc.cls || ""}"><div class="k">${cc.k}</div><div class="v">${cc.v}</div></div>`
+  ).join("");
+
+  $("#outageTbody").innerHTML = a.scenarios.map((s) => {
+    const pipeDesc = `${escapeHtml(s.pipe_id)}` +
+      ` <span class="hint">(${escapeHtml(s.removed_pipe.start)} → ${escapeHtml(s.removed_pipe.end)})</span>`;
+    let unserved = "—", minHeadCell = "—", below = "—", newly = "—";
+    let rowCls = "";
+    if (s.status === "disconnected") {
+      rowCls = "row-disconnected";
+      unserved = `<span class="pill pill-low">${s.unserved_nodes.map(escapeHtml).join("、")}</span>` +
+        `<div class="sub">失供需水量 Σd = <b>${fmt(s.unserved_demand)}</b>（不生成水头）</div>`;
+    } else if (s.status === "not_converged") {
+      rowCls = "row-noconverge";
+      unserved = "—";
+      minHeadCell = "—";
+      below = "—";
+      newly = `<span class="nc-note">该情景单独不收敛，已排最后，不影响其余情景。</span>`;
+    } else {
+      if (s.min_demand_head < a.min_head) rowCls = "row-lowhead";
+      minHeadCell = `${fmt(s.min_demand_head)}` +
+        ` <span class="hint">@ ${escapeHtml(s.min_demand_head_node)}</span>`;
+      below = s.below_min_head.length
+        ? s.below_min_head.map(escapeHtml).join("、")
+        : `<span class="pill pill-ok">无</span>`;
+      newly = s.new_below_min_head.length
+        ? `<span class="pill pill-low">${s.new_below_min_head.map(escapeHtml).join("、")}</span>`
+        : `<span class="pill pill-ok">无新增</span>`;
+    }
+    return `<tr class="${rowCls}">
+      <td class="num-col">${s.rank}</td>
+      <td class="cell-id">${pipeDesc}</td>
+      <td>${outageStatusCell(s)}</td>
+      <td>${unserved}</td>
+      <td class="num-col">${minHeadCell}</td>
+      <td>${below}</td>
+      <td>${newly}</td>
+    </tr>`;
+  }).join("");
+
+  $("#outagePanel").scrollIntoView({ behavior: "smooth", block: "nearest" });
+}
+
 function setBanner(kind, text) {
   const b = $("#banner");
   b.className = `banner banner-${kind}`;
@@ -599,10 +710,23 @@ function setBanner(kind, text) {
 
 /* 求解后任何编辑都会让旧结果失效，提示重新求解 */
 function markDirty() {
-  if (!state.result) return;
+  const hadOutage = !!state.outage;
+  const hadResult = !!state.result;
+  clearOutage();
+  if (!hadResult) {
+    if (hadOutage) setBanner("idle", "输入已修改，旧的停管分析已清除，请重新点击“停管分析”。");
+    return;
+  }
   state.result = null;
   $("#resultsPanel").hidden = true;
   setBanner("idle", "输入已修改，请重新点击“求解”。");
+}
+
+/* 节点、管段或最低水头一旦变动，旧的停管分析立即失效并清除 */
+function clearOutage() {
+  if (!state.outage) return;
+  state.outage = null;
+  $("#outagePanel").hidden = true;
 }
 
 /* ------------------------------ 结果展示 ------------------------------ */
@@ -667,9 +791,12 @@ $("#addPipeBtn").addEventListener("click", addPipe);
 $("#sampleBtn").addEventListener("click", loadSample);
 $("#resetBtn").addEventListener("click", resetAll);
 $("#solveBtn").addEventListener("click", solve);
+$("#outageBtn").addEventListener("click", analyzeOutages);
 $("#relayoutBtn").addEventListener("click", () => { initPositions(true); draw(); });
 $("#minHeadInput").addEventListener("input", (e) => {
   state.minHead = e.target.value;
+  // 最低水头限值属于分析参数：一旦改动，旧停管分析立即清除
+  clearOutage();
   if (state.result) {
     // 最低水头变化时本地重算标红，无需重新求解
     const mh = Number(state.minHead);

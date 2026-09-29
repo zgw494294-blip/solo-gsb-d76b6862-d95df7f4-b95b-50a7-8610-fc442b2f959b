@@ -11,7 +11,9 @@ from fastapi.testclient import TestClient
 from app.main import app
 from app.solver import (
     CHECK_TOL,
+    SolverNotConverged,
     ValidationError,
+    analyze_pipe_outages,
     solve_network,
     validate_payload,
 )
@@ -283,3 +285,211 @@ def test_random_connected_networks():
         assert math.isclose(res["source_supply"], res["total_demand"], abs_tol=CHECK_TOL)
         n_ok += 1
     assert n_ok == 60
+
+
+# ---------------------------- 逐根停管分析 ---------------------------- #
+def _tree_payload():
+    """树状网：每根管段都是桥，移除必有失供。
+
+        S --P1-- A(需 2) --P2-- B(需 3) --P3-- C(需 4)
+    """
+    return {
+        "nodes": [
+            {"id": "S", "type": "source", "head": 50.0},
+            {"id": "A", "type": "demand", "demand": 2.0},
+            {"id": "B", "type": "demand", "demand": 3.0},
+            {"id": "C", "type": "demand", "demand": 4.0},
+        ],
+        "pipes": [
+            {"id": "P1", "start": "S", "end": "A", "r": 1.0},
+            {"id": "P2", "start": "A", "end": "B", "r": 1.0},
+            {"id": "P3", "start": "B", "end": "C", "r": 1.0},
+        ],
+        "min_head": 0.0,
+    }
+
+
+def test_outage_tree_all_disconnected_sorted_by_unserved_demand():
+    a = analyze_pipe_outages(validate_payload(_tree_payload()))
+    stats = [(s["pipe_id"], s["status"]) for s in a["scenarios"]]
+    assert stats == [
+        ("P1", "disconnected"),  # 失供 2+3+4=9
+        ("P2", "disconnected"),  # 失供 3+4=7
+        ("P3", "disconnected"),  # 失供 4
+    ]
+    first = a["scenarios"][0]
+    assert first["unserved_nodes"] == ["A", "B", "C"]
+    assert first["unserved_demand"] == pytest.approx(9.0)
+    assert "min_demand_head" not in first  # 断联情景不生成水头
+    assert a["scenarios"][1]["unserved_nodes"] == ["B", "C"]
+    assert a["scenarios"][1]["unserved_demand"] == pytest.approx(7.0)
+    assert a["scenarios"][2]["unserved_nodes"] == ["C"]
+    assert [s["rank"] for s in a["scenarios"]] == [1, 2, 3]
+    assert a["counts"] == {"disconnected": 3, "connected": 0, "not_converged": 0}
+
+
+def _loop_branch_payload():
+    """环 + 两根枝：P4、P5 为桥，P1～P3 构成 S-A-B-S 环。
+
+        S ──P1── A(需1) ──P2── B(需1) ──P4── D(需5)
+         │                  │                    （挂枝）
+         └──────P3──────────┘
+        A ──P5── E(需2)（挂枝）
+    """
+    return {
+        "nodes": [
+            {"id": "S", "type": "source", "head": 40.0},
+            {"id": "A", "type": "demand", "demand": 1.0},
+            {"id": "B", "type": "demand", "demand": 1.0},
+            {"id": "D", "type": "demand", "demand": 5.0},
+            {"id": "E", "type": "demand", "demand": 2.0},
+        ],
+        "pipes": [
+            {"id": "P1", "start": "S", "end": "A", "r": 1.0},
+            {"id": "P2", "start": "A", "end": "B", "r": 1.0},
+            {"id": "P3", "start": "B", "end": "S", "r": 1.0},
+            {"id": "P4", "start": "B", "end": "D", "r": 1.0},
+            {"id": "P5", "start": "A", "end": "E", "r": 1.0},
+        ],
+        "min_head": 0.0,
+    }
+
+
+def test_outage_mixed_grouping_and_connected_fields():
+    payload = _loop_branch_payload()
+    a = analyze_pipe_outages(validate_payload(payload))
+    statuses = [(s["pipe_id"], s["status"]) for s in a["scenarios"]]
+    # 断联情景在前，按失供量降序：P4 失供 D(5) > P5 失供 E(2)
+    assert statuses[:2] == [("P4", "disconnected"), ("P5", "disconnected")]
+    # 随后是三个连通情景，按最低用水节点水头升序
+    connected = [s for s in a["scenarios"] if s["status"] == "connected"]
+    assert len(connected) == 3
+    # 失去 S-B 直通管 P3 时最不利，其次失去 S-A 管 P1，最后失去环中段 P2
+    assert [s["pipe_id"] for s in connected] == ["P3", "P1", "P2"]
+    heads = [s["min_demand_head"] for s in connected]
+    assert heads == sorted(heads)
+
+    p4 = a["scenarios"][0]
+    assert p4["unserved_nodes"] == ["D"]
+    assert p4["unserved_demand"] == pytest.approx(5.0)
+
+    # 连通情景字段完整，且与独立重解一致
+    net = validate_payload(payload)
+    for s in connected:
+        idx = next(i for i, p in enumerate(net.pipes) if p["id"] == s["pipe_id"])
+        sub = type(net)(nodes=net.nodes,
+                        pipes=net.pipes[:idx] + net.pipes[idx + 1:],
+                        min_head=net.min_head)
+        res = solve_network(sub)
+        demand_ids = [n["id"] for n in net.nodes if n["type"] == "demand"]
+        assert s["min_demand_head"] == pytest.approx(
+            min(res["heads"][nid] for nid in demand_ids), abs=1e-9)
+        assert s["below_min_head"] == res["below_min_head"]
+        assert s["solution"]["source_supply"] == pytest.approx(
+            res["source_supply"], abs=1e-9)
+
+    # 基线与各情景共用同一限值；baseline 中低水头节点集合随分析返回
+    assert a["baseline"]["converged"] is True
+    assert set(a["baseline_below_min_head"]) == set(a["baseline"]["below_min_head"])
+
+
+def test_outage_new_below_min_head_nodes():
+    """选择使基线合格、但移除 P1 后 B 点水头跌破限值的阈值。"""
+    payload = _loop_branch_payload()
+    net = validate_payload(payload)
+    baseline = solve_network(net)
+    # 找到一个移除后最低水头下降最多的环管，以其最低水头与基线最低水头之间取限值
+    a0 = analyze_pipe_outages(net)
+    worst = min((s for s in a0["scenarios"] if s["status"] == "connected"),
+                key=lambda s: s["min_demand_head"])
+    threshold = (worst["min_demand_head"] +
+                 min(baseline["heads"][n["id"]]
+                     for n in net.nodes if n["type"] == "demand")) / 2
+    payload["min_head"] = threshold
+    a = analyze_pipe_outages(validate_payload(payload))
+    base_below = set(a["baseline_below_min_head"])
+    assert base_below == set()  # 限值取在两者之间，基线应全部合格
+    target = next(s for s in a["scenarios"] if s["pipe_id"] == worst["pipe_id"])
+    assert target["new_below_min_head"], "最差情景应出现比基线新增的低水头节点"
+    assert set(target["new_below_min_head"]).issubset(set(target["below_min_head"]))
+    # 其余连通情景的“新增”集合 = 情景低水头集合 − 基线低水头集合
+    for s in a["scenarios"]:
+        if s["status"] == "connected":
+            assert s["new_below_min_head"] == [
+                nid for nid in s["below_min_head"] if nid not in base_below]
+
+
+def test_outage_tie_keeps_pipe_entry_order():
+    """同分情景保持管段录入顺序：base_loop 关于 S-B 对角线镜像对称，
+    移除 P1（S-A）与 P4（C-S）最低水头相同；移除 P2（A-B）与 P3（B-C）亦相同。"""
+    payload = base_loop()
+    a = analyze_pipe_outages(validate_payload(payload))
+    # 无断联（原图连通，单管移除后仍连通）
+    assert a["counts"]["disconnected"] == 0
+    ordered = a["scenarios"]
+    by_id = {s["pipe_id"]: s for s in ordered}
+    assert by_id["P1"]["min_demand_head"] == pytest.approx(
+        by_id["P4"]["min_demand_head"], abs=1e-9)
+    assert by_id["P2"]["min_demand_head"] == pytest.approx(
+        by_id["P3"]["min_demand_head"], abs=1e-9)
+    # 录入顺序相同的 P1 排在 P4 前、P2 排在 P3 前
+    assert by_id["P1"]["rank"] < by_id["P4"]["rank"]
+    assert by_id["P2"]["rank"] < by_id["P3"]["rank"]
+    # 整体仍按最低水头非降序
+    hs = [s["min_demand_head"] for s in ordered]
+    assert hs == sorted(hs)
+    assert [s["rank"] for s in ordered] == list(range(1, len(ordered) + 1))
+
+
+def test_outage_single_nonconverged_scenario_marked_and_last(monkeypatch):
+    """某一情景单独不收敛：标明并置于最后，其余情景照常给出。"""
+    payload = _loop_branch_payload()
+    real_solve = solve_network
+    call = {"n": 0}
+
+    def fake_solve(net):
+        # analyze_pipe_outages 的第 2 次求解 = 移除第 0 根管（P1）的情景
+        call["n"] += 1
+        if call["n"] == 2:
+            raise SolverNotConverged("模拟 P1 情景不收敛")
+        return real_solve(net)
+
+    monkeypatch.setattr("app.solver.solve_network", fake_solve)
+    a = analyze_pipe_outages(validate_payload(payload))
+    assert a["counts"] == {"disconnected": 2, "connected": 2, "not_converged": 1}
+    last = a["scenarios"][-1]
+    assert last["status"] == "not_converged"
+    assert last["pipe_id"] == "P1"
+    assert "模拟 P1 情景不收敛" in last["error"]
+    # 断联在前、连通居中、不收敛最后
+    order = [s["status"] for s in a["scenarios"]]
+    assert order == ["disconnected", "disconnected", "connected", "connected",
+                     "not_converged"]
+    assert all("min_demand_head" in s for s in a["scenarios"]
+               if s["status"] == "connected")
+
+
+# ---------------------------- 停管分析 API ---------------------------- #
+def test_api_analyze_outages_ok():
+    resp = client.post("/api/analyze-outages", json=_tree_payload())
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["ok"] is True
+    a = data["analysis"]
+    assert [s["pipe_id"] for s in a["scenarios"]] == ["P1", "P2", "P3"]
+    assert a["scenarios"][0]["unserved_demand"] == pytest.approx(9.0)
+    assert a["baseline"]["converged"] is True
+
+
+def test_api_analyze_outages_validation_error():
+    payload = _tree_payload()
+    payload["pipes"][0]["r"] = 0
+    resp = client.post("/api/analyze-outages", json=payload)
+    assert resp.status_code == 422
+    assert "阻力" in resp.json()["error"]
+
+
+def test_api_analyze_outages_empty_body():
+    resp = client.post("/api/analyze-outages", content=b"",
+                       headers={"Content-Type": "application/json"})
+    assert resp.status_code == 400

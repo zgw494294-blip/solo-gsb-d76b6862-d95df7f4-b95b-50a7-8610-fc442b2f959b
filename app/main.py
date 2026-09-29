@@ -1,4 +1,4 @@
-"""FastAPI 入口：/api/solve 负责校验与求解，其余路径提供原生前端静态页面。"""
+"""FastAPI 入口：/api/solve 与 /api/analyze-outages 负责校验与求解，其余路径提供原生前端静态页面。"""
 
 from __future__ import annotations
 
@@ -13,6 +13,7 @@ from fastapi.staticfiles import StaticFiles
 from .solver import (
     SolverNotConverged,
     ValidationError,
+    analyze_pipe_outages,
     solve_network,
     validate_payload,
 )
@@ -33,18 +34,26 @@ def health() -> dict[str, str]:
     return {"status": "ok"}
 
 
-@app.post("/api/solve")
-async def solve(request: Request) -> JSONResponse:
+async def _load_payload(request: Request) -> tuple[Any, JSONResponse | None]:
+    """读取原始请求体并解析 JSON；任何问题转成统一的 400 响应。"""
     raw = await request.body()
     if not raw:
-        return JSONResponse(status_code=400, content={
+        return None, JSONResponse(status_code=400, content={
             "ok": False, "error": "请求体为空，请先填写节点与管段数据。"})
     try:
         payload = json.loads(raw.decode("utf-8"), parse_constant=_reject_constant)
     except (ValueError, UnicodeDecodeError) as exc:
-        return JSONResponse(status_code=400, content={
+        return None, JSONResponse(status_code=400, content={
             "ok": False,
             "error": f"请求体不是合法 JSON：{exc}。请确认所有输入均为有限数值。"})
+    return payload, None
+
+
+@app.post("/api/solve")
+async def solve(request: Request) -> JSONResponse:
+    payload, bad = await _load_payload(request)
+    if bad is not None:
+        return bad
 
     try:
         network = validate_payload(payload)
@@ -57,6 +66,26 @@ async def solve(request: Request) -> JSONResponse:
                             content={"ok": False, "error": str(exc)})
 
     return JSONResponse(content={"ok": True, "result": result})
+
+
+@app.post("/api/analyze-outages")
+async def analyze_outages(request: Request) -> JSONResponse:
+    """逐根停管情景分析：先求基线，再对每根管段各评估一个移除情景。"""
+    payload, bad = await _load_payload(request)
+    if bad is not None:
+        return bad
+
+    try:
+        network = validate_payload(payload)
+        analysis = analyze_pipe_outages(network)
+    except ValidationError as exc:
+        return JSONResponse(status_code=422,
+                            content={"ok": False, "error": str(exc)})
+    except SolverNotConverged as exc:
+        return JSONResponse(status_code=422,
+                            content={"ok": False, "error": str(exc)})
+
+    return JSONResponse(content={"ok": True, "analysis": analysis})
 
 
 # 静态资源（index.html / style.css / app.js）——该路由必须最后注册

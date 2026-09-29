@@ -459,3 +459,117 @@ def solve_network(net: Network) -> dict[str, Any]:
         "min_head": net.min_head,
         "below_min_head": below,
     }
+
+
+# --------------------------------------------------------------------------- #
+# 逐根停管情景分析
+# --------------------------------------------------------------------------- #
+def _reachable_nodes(net: Network, disabled: int) -> set[str]:
+    """无向 BFS：返回不使用第 disabled 根管段时，从水源可达的全部节点编号。"""
+    source_id = next(n["id"] for n in net.nodes if n["type"] == "source")
+    adj: dict[str, list[str]] = {n["id"]: [] for n in net.nodes}
+    for p, pipe in enumerate(net.pipes):
+        if p == disabled:
+            continue
+        adj[pipe["start"]].append(pipe["end"])
+        adj[pipe["end"]].append(pipe["start"])
+    seen = {source_id}
+    queue = deque([source_id])
+    while queue:
+        u = queue.popleft()
+        for v in adj[u]:
+            if v not in seen:
+                seen.add(v)
+                queue.append(v)
+    return seen
+
+
+def analyze_pipe_outages(net: Network) -> dict[str, Any]:
+    """对每根管段各构造一个“移除该管”的独立情景并评估后果。
+
+    情景分为三类：
+      * disconnected —— 有用水节点与水源断开，列出失供节点与失供需水量之和，
+        不生成水头；
+      * connected    —— 全部节点仍与水源连通，重新稳态求解，列出最低用水节点
+        水头、低于当前限值的节点及相对基线新增的低水头节点；
+      * not_converged —— 该情景单独不收敛，标明后排在最后，不影响其余情景。
+
+    排序：断联情景按失供量降序在前，连通情景按最低用水节点水头升序随后，
+    同分保持管段录入顺序；不收敛情景一律排最后（同分同样保持录入顺序）。
+    """
+    baseline = solve_network(net)
+    demand_map = {n["id"]: n["demand"] for n in net.nodes if n["type"] == "demand"}
+    baseline_below = set(baseline["below_min_head"])
+
+    scenarios: list[dict[str, Any]] = []
+    for p, pipe in enumerate(net.pipes):
+        scenario: dict[str, Any] = {
+            "rank": 0,
+            "pipe_id": pipe["id"],
+            "pipe_index": p,
+            "removed_pipe": {"id": pipe["id"], "start": pipe["start"],
+                             "end": pipe["end"], "r": pipe["r"]},
+        }
+        reachable = _reachable_nodes(net, p)
+        unserved = [nid for nid in demand_map if nid not in reachable]
+        if unserved:
+            scenario.update({
+                "status": "disconnected",
+                "unserved_nodes": unserved,
+                "unserved_demand": float(sum(demand_map[nid] for nid in unserved)),
+            })
+            scenarios.append(scenario)
+            continue
+
+        # 仍连通：在剔除该管段的子网上重新求解
+        sub_net = Network(
+            nodes=net.nodes,
+            pipes=net.pipes[:p] + net.pipes[p + 1:],
+            min_head=net.min_head,
+        )
+        try:
+            result = solve_network(sub_net)
+        except SolverNotConverged as exc:
+            scenario.update({"status": "not_converged", "error": str(exc)})
+            scenarios.append(scenario)
+            continue
+
+        heads = result["heads"]
+        below = result["below_min_head"]
+        demand_ids = list(demand_map)
+        scenario.update({
+            "status": "connected",
+            "min_demand_head": float(min(heads[nid] for nid in demand_ids)),
+            # 水头并列时 min 取录入顺序的第一个节点
+            "min_demand_head_node": min(demand_ids, key=lambda nid: heads[nid]),
+            "below_min_head": below,
+            "new_below_min_head": [nid for nid in below if nid not in baseline_below],
+            "source_supply": result["source_supply"],
+            "total_demand": result["total_demand"],
+            "solution": result,
+        })
+        scenarios.append(scenario)
+
+    def sort_key(s: dict[str, Any]) -> tuple[int, float, int]:
+        if s["status"] == "disconnected":
+            # 失供量越大越靠前：取负实现降序
+            return (0, -s["unserved_demand"], s["pipe_index"])
+        if s["status"] == "connected":
+            return (1, s["min_demand_head"], s["pipe_index"])
+        return (2, 0.0, s["pipe_index"])
+
+    scenarios.sort(key=sort_key)
+    for rank, s in enumerate(scenarios, start=1):
+        s["rank"] = rank
+
+    counts = {"disconnected": 0, "connected": 0, "not_converged": 0}
+    for s in scenarios:
+        counts[s["status"]] += 1
+
+    return {
+        "min_head": net.min_head,
+        "baseline": baseline,
+        "baseline_below_min_head": baseline["below_min_head"],
+        "scenarios": scenarios,
+        "counts": counts,
+    }
